@@ -517,6 +517,9 @@ class MainWindow(QMainWindow):
         b_run = QPushButton("运行对比（需先扫描订单并拉取飞书）")
         b_run.clicked.connect(self._run_compare)
         btns.addWidget(b_run)
+        b_submit = QPushButton("自动提交缺发票（上传三合一并提交）")
+        b_submit.clicked.connect(self._auto_submit)
+        btns.addWidget(b_submit)
         b_export = QPushButton("导出报告")
         b_export.clicked.connect(self._export_report)
         btns.addWidget(b_export)
@@ -562,6 +565,114 @@ class MainWindow(QMainWindow):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self._last_report)
             QMessageBox.information(self, "完成", f"已导出到 {path}")
+
+    # ---- 自动提交缺发票 ----
+    # 发票提交表单控件 id（来自真实实例 6724FA78）：
+    #   关联审批 widget17568428314240001(connect) / 金额 widget17619312245230001(amount)
+    #   组别 widget17628791941920001(radioV2) / 三合一PDF widget17568428666990001(attachmentV2)
+    GROUP_OPTION = {"22备赛飞机队": "mujg5atu-aodbmpmn62-1"}
+
+    @staticmethod
+    def _find_pdf(tri_dir, amt):
+        """在三合一目录中按金额找对应 PDF（命名：施宇豪_组别_金额_随机.pdf）"""
+        import re
+        pat = f"{amt:g}"
+        for fn in os.listdir(tri_dir):
+            if not fn.lower().endswith(".pdf"):
+                continue
+            if f"_{pat}_" in fn or fn.endswith(f"_{pat}.pdf"):
+                return os.path.join(tri_dir, fn)
+        for fn in os.listdir(tri_dir):
+            if not fn.lower().endswith(".pdf"):
+                continue
+            for n in re.findall(r"\d+(?:\.\d+)?", fn):
+                try:
+                    if abs(float(n) - amt) < 0.005:
+                        return os.path.join(tri_dir, fn)
+                except Exception:
+                    continue
+        return None
+
+    def _auto_submit(self):
+        if not self.orders:
+            QMessageBox.warning(self, "提示", "请先在「整理」页扫描订单")
+            return
+        if not self.buy_rows:
+            QMessageBox.warning(self, "提示", "请先在「飞书」页拉取数据")
+            return
+        fu = self._feishu()
+        if not fu.has_token:
+            QMessageBox.warning(self, "提示", "尚未授权登录，请先点「扫码授权登录」")
+            return
+        result = compare.compare(self.orders, self.buy_rows, self.invoice_rows)
+        targets = result["buy_ok_no_invoice"]
+        if not targets:
+            QMessageBox.information(self, "提示", "没有发现「已申请购买、未提交发票」的订单")
+            return
+        group = self.cfg.get("group") or self.cfg.get("team") or ""
+        opt = self.GROUP_OPTION.get(group, "")
+        if not opt:
+            QMessageBox.warning(self, "提示",
+                                f"暂不支持自动提交组别「{group}」，请把该组别的选项值补充到 GROUP_OPTION")
+            return
+        tri_dir = self.cfg.get("output_path_absolute") or os.path.join(self.cfg.get("root_dir", ""), "三合一")
+        if not os.path.isdir(tri_dir):
+            QMessageBox.warning(self, "提示", f"找不到三合一目录：{tri_dir}")
+            return
+        # 购买申请：金额 -> 实例码（只取有效状态）
+        buy_code = {}
+        for r in self.buy_rows:
+            if not compare._valid_status(r.get("状态")):
+                continue
+            a = compare._norm(r.get("金额"))
+            if a is not None:
+                buy_code.setdefault(a, r.get("实例码", ""))
+
+        def job():
+            ok_list, fail_list = [], []
+            for it in targets:
+                amt = it["金额"]
+                code = buy_code.get(amt, "")
+                pdf = self._find_pdf(tri_dir, amt)
+                if not code:
+                    fail_list.append((it["订单"], "未找到对应购买申请实例码"))
+                    continue
+                if not pdf:
+                    fail_list.append((it["订单"], "未找到匹配金额的三合一 PDF"))
+                    continue
+                try:
+                    fc = fu.upload_file(pdf)
+                    form = [
+                        {"id": "widget17568428314240001", "type": "connect", "value": [code]},
+                        {"id": "widget17619312245230001", "type": "amount", "value": amt},
+                        {"id": "widget17628791941920001", "type": "radioV2", "value": opt},
+                        {"id": "widget17568428666990001", "type": "attachmentV2", "value": [fc]},
+                    ]
+                    ic = fu.create_instance(feishu_api.APPROVAL_INVOICE, form)
+                    ok_list.append((it["订单"], ic))
+                except Exception as e:
+                    fail_list.append((it["订单"], str(e)))
+            return ok_list, fail_list
+
+        sig = WorkerSignals()
+        sig.done.connect(self._on_auto_submit_done)
+        run_thread(job, sig)
+
+    def _on_auto_submit_done(self, payload):
+        ok, res = payload
+        if not ok:
+            QMessageBox.critical(self, "自动提交失败", str(res))
+            return
+        ok_list, fail_list = res
+        lines = [f"自动提交完成：成功 {len(ok_list)}，失败 {len(fail_list)}"]
+        for name, ic in ok_list:
+            lines.append(f"  ✅ {name} → {ic}")
+        for name, err in fail_list:
+            lines.append(f"  ❌ {name} → {err}")
+        msg = "\n".join(lines)
+        self.report_view.append("\n" + msg)
+        QMessageBox.information(self, "自动提交结果", msg)
+        self._fetch()   # 提交后自动刷新
 
 
 def main():

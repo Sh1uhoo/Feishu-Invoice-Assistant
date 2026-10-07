@@ -211,32 +211,63 @@ class FeishuUser:
         return self.list_instances(APPROVAL_INVOICE)
 
     # ---- 提交 ----
-    def upload_file(self, file_path: str) -> str:
-        """上传审批文件，返回 file_code（供附件/图片控件使用）"""
+    def _tenant_token(self) -> str:
+        """获取应用身份（tenant_access_token），审批文件上传必须用应用身份"""
+        if not self.app_id or not self.app_secret:
+            raise FeishuError("请先填写 App ID 和 App Secret")
+        resp = requests.post(
+            f"{BASE}/auth/v3/tenant_access_token/internal",
+            json={"app_id": self.app_id, "app_secret": self.app_secret},
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            raise FeishuError(f"获取应用凭证失败: {data.get('msg', data)}")
+        return data["tenant_access_token"]
+
+    def upload_file(self, file_path: str, file_type: str = "attachment") -> str:
+        """上传审批文件（应用身份调用审批上传接口），返回 file_code（供附件/图片控件使用）
+
+        注意：审批附件控件只认「审批系统文件 code」，必须走本接口；
+        drive 云盘上传返回的 file_token 不认（实测 1395006）。
+        需要应用身份权限：访问审批应用（approval:approval:readonly / approval:approval）
+        """
+        name = os.path.basename(file_path)
+        tt = self._tenant_token()
         with open(file_path, "rb") as f:
             resp = requests.post(
-                f"{BASE}/approval/v1/files/upload",
-                headers=self._headers(),
-                files={"file": (os.path.basename(file_path), f, "application/octet-stream")},
-                timeout=60,
+                "https://www.feishu.cn/approval/openapi/v2/file/upload",
+                headers={"Authorization": f"Bearer {tt}"},
+                data={"name": name, "type": file_type},
+                files={"content": (name, f, "application/octet-stream")},
+                timeout=90,
             )
         data = resp.json()
         if data.get("code") != 0:
-            raise FeishuError(f"上传文件失败: {data.get('msg', data)}")
-        return data["data"]["file_code"]
+            raise FeishuError(f"上传审批文件失败: {data.get('msg', data)}")
+        return data["data"]["code"]
 
     def create_instance(self, approval_code: str, form: list,
                         node_approver_list: list | None = None,
                         node_cc_list: list | None = None) -> str:
-        """创建审批实例，返回 instance_code"""
+        """创建审批实例（用户身份，POST /approval/v4/instances/initiate），返回 instance_code"""
         body = {"approval_code": approval_code, "form": json.dumps(form, ensure_ascii=False)}
         if node_approver_list:
             body["node_approver_list"] = node_approver_list
         if node_cc_list:
             body["node_cc_list"] = node_cc_list
-        resp = requests.post(f"{BASE}/approval/v4/instances",
+        resp = requests.post(f"{BASE}/approval/v4/instances/initiate",
                              headers=self._headers(), json=body, timeout=30)
         data = resp.json()
         if data.get("code") != 0:
             raise FeishuError(f"提交审批失败: {data.get('msg', data)}")
         return data["data"]["instance_code"]
+
+    def recall_instance(self, instance_code: str) -> None:
+        """撤回审批实例（用户身份，POST /approval/v4/instances/recall）"""
+        resp = requests.post(f"{BASE}/approval/v4/instances/recall",
+                             headers=self._headers(),
+                             json={"instance_code": instance_code}, timeout=30)
+        data = resp.json()
+        if data.get("code") != 0:
+            raise FeishuError(f"撤回审批失败: {data.get('msg', data)}")
