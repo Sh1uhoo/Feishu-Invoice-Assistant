@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 import organize
 import compare
+import ai_pair
 import feishu_api
 from feishu_api import FeishuApproval, FeishuUser
 
@@ -84,7 +85,6 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_overview_tab(), "总览")
         tabs.addTab(self._build_organize_tab(), "整理")
         tabs.addTab(self._build_feishu_tab(), "飞书")
-        tabs.addTab(self._build_compare_tab(), "对比")
         self.setCentralWidget(tabs)
         # 署名：窗口右下角
         sb = self.statusBar()
@@ -97,9 +97,15 @@ class MainWindow(QMainWindow):
         w = QWidget()
         lay = QVBoxLayout(w)
         top = QHBoxLayout()
-        b_refresh = QPushButton("刷新总览（需已扫描订单并拉取飞书）")
+        b_refresh = QPushButton("刷新总览（自动扫描+拉取飞书）")
         b_refresh.clicked.connect(self._refresh_overview)
         top.addWidget(b_refresh)
+        b_export = QPushButton("导出报告")
+        b_export.clicked.connect(self._export_report)
+        top.addWidget(b_export)
+        b_submit = QPushButton("自动提交缺发票")
+        b_submit.clicked.connect(self._auto_submit)
+        top.addWidget(b_submit)
         self.overview_stat = QLabel("")
         top.addWidget(self.overview_stat, 1)
         lay.addLayout(top)
@@ -208,6 +214,36 @@ class MainWindow(QMainWindow):
         top.addWidget(btn_scan)
         lay.addLayout(top)
 
+        # ---- AI 配对区 ----
+        ai_box = QGroupBox("AI 配对：识别散照片，按金额自动配对成订单文件夹")
+        g = QGridLayout(ai_box)
+        g.addWidget(QLabel("API 地址:"), 0, 0)
+        self.ai_url_edit = QLineEdit(self.cfg.get("ai_url", ""))
+        self.ai_url_edit.setPlaceholderText("https://ark.cn-beijing.volces.com/api/v3/chat/completions")
+        g.addWidget(self.ai_url_edit, 0, 1, 1, 2)
+        g.addWidget(QLabel("API Key:"), 1, 0)
+        self.ai_key_edit = QLineEdit(self.cfg.get("ai_key", ""))
+        self.ai_key_edit.setEchoMode(QLineEdit.Password)
+        g.addWidget(self.ai_key_edit, 1, 1, 1, 2)
+        g.addWidget(QLabel("模型名:"), 2, 0)
+        self.ai_model_edit = QLineEdit(self.cfg.get("ai_model", ""))
+        self.ai_model_edit.setPlaceholderText("如 doubao-seed-1-6 / qwen-vl-max / glm-4v-flash")
+        g.addWidget(self.ai_model_edit, 2, 1, 1, 2)
+        g.addWidget(QLabel("散照片目录:"), 3, 0)
+        self.ai_dir_edit = QLineEdit(self.cfg.get("ai_dir", ""))
+        g.addWidget(self.ai_dir_edit, 3, 1)
+        btn_ai_dir = QPushButton("浏览...")
+        btn_ai_dir.clicked.connect(self._pick_ai_dir)
+        g.addWidget(btn_ai_dir, 3, 2)
+        btn_ai = QPushButton("开始 AI 配对")
+        btn_ai.clicked.connect(self._run_ai_pair)
+        g.addWidget(btn_ai, 4, 1)
+        tip_ai = QLabel("支持任意 OpenAI 兼容视觉接口；配对后生成 0X-商品-金额元 文件夹（两张图放一起），单张的会在日志提醒")
+        tip_ai.setWordWrap(True)
+        tip_ai.setStyleSheet("color: #888;")
+        g.addWidget(tip_ai, 5, 0, 1, 3)
+        lay.addWidget(ai_box)
+
         self.order_table = self._make_table(
             ["序号", "订单", "金额", "文件数", "发票PDF", "三合一"], [60, 400, 80, 80, 80, 80])
         lay.addWidget(self.order_table, 3)
@@ -281,6 +317,78 @@ class MainWindow(QMainWindow):
             self._log(f"汇总失败：{res}")
             return
         self._log(f"购买记录汇总完成：新增复制 {res} 个文件到 购买记录\\")
+
+    # ---- AI 配对 ----
+    def _pick_ai_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择散照片目录", self.ai_dir_edit.text())
+        if d:
+            self.ai_dir_edit.setText(d)
+
+    def _run_ai_pair(self):
+        url = self.ai_url_edit.text().strip()
+        key = self.ai_key_edit.text().strip()
+        model = self.ai_model_edit.text().strip()
+        src = self.ai_dir_edit.text().strip()
+        root = self.root_edit.text().strip()
+        if not (url and key and model):
+            QMessageBox.warning(self, "提示", "请先填写 AI 的 API 地址、Key 和模型名")
+            return
+        if not os.path.isdir(src):
+            QMessageBox.warning(self, "提示", "散照片目录无效")
+            return
+        if not os.path.isdir(root):
+            QMessageBox.warning(self, "提示", "发票根目录无效")
+            return
+        self.cfg.update({"ai_url": url, "ai_key": key, "ai_model": model,
+                         "ai_dir": src, "root_dir": root})
+        save_config(self.cfg)
+        exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+        images = [os.path.join(src, f) for f in sorted(os.listdir(src))
+                  if f.lower().endswith(exts) and os.path.isfile(os.path.join(src, f))]
+        if not images:
+            QMessageBox.warning(self, "提示", "散照片目录里没有图片")
+            return
+        self._log(f"AI 配对开始：{len(images)} 张图片 → 模型 {model}")
+
+        def job():
+            results, errs = [], []
+            for img in images:
+                try:
+                    r = ai_pair.identify_image(url, key, model, img)
+                    r["path"] = img
+                    results.append(r)
+                except Exception as e:
+                    errs.append((os.path.basename(img), str(e)))
+            pairs, singles = ai_pair.pair_images(results)
+            folders, fail = ai_pair.create_order_folders(pairs, root)
+            return results, pairs, singles, folders, fail, errs
+
+        sig = WorkerSignals()
+        sig.done.connect(self._on_ai_pair_done)
+        run_thread(job, sig)
+
+    def _on_ai_pair_done(self, payload):
+        ok, res = payload
+        if not ok:
+            self._log(f"AI 配对失败：{res}")
+            QMessageBox.critical(self, "AI 配对失败", str(res))
+            return
+        results, pairs, singles, folders, fail, errs = res
+        lines = [f"AI 配对完成：识别 {len(results)} 张，配对 {len(pairs)} 对，生成 {len(folders)} 个文件夹"]
+        for name, copied in folders:
+            lines.append(f"  ✅ {name}（{'、'.join(os.path.basename(c) for c in copied)}）")
+        if singles:
+            lines.append(f"单张未配对 {len(singles)} 个：")
+            for s in singles:
+                lines.append(f"  ⚠️ {os.path.basename(s['path'])}（{s['类别']} {s['金额'] or '?'}元，{s['原因']}）")
+        if errs:
+            lines.append(f"识别失败 {len(errs)} 个：")
+            for name, e in errs:
+                lines.append(f"  ❌ {name} → {e}")
+        for l in lines:
+            self._log(l)
+        self._scan()   # 配对后刷新订单
+        QMessageBox.information(self, "AI 配对结果", "\n".join(lines))
 
     def _log(self, msg):
         self.log_view.append(msg)
@@ -509,61 +617,16 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "完成",
                                 f"拉取完成：购买申请 {len(self.buy_rows)} 条，发票提交 {len(self.invoice_rows)} 条")
 
-    # ---- 对比页 ----
-    def _build_compare_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        btns = QHBoxLayout()
-        b_run = QPushButton("运行对比（需先扫描订单并拉取飞书）")
-        b_run.clicked.connect(self._run_compare)
-        btns.addWidget(b_run)
-        b_submit = QPushButton("自动提交缺发票（上传三合一并提交）")
-        b_submit.clicked.connect(self._auto_submit)
-        btns.addWidget(b_submit)
-        b_export = QPushButton("导出报告")
-        b_export.clicked.connect(self._export_report)
-        btns.addWidget(b_export)
-        lay.addLayout(btns)
-
-        self.cmp_table = self._make_table(
-            ["类别", "订单", "金额", "购买申请", "发票"], [160, 360, 90, 200, 120])
-        lay.addWidget(self.cmp_table, 3)
-        lay.addWidget(QLabel("报告:"))
-        self.report_view = QTextEdit()
-        self.report_view.setReadOnly(True)
-        lay.addWidget(self.report_view, 2)
-        self._last_report = ""
-        return w
-
-    def _run_compare(self):
+    def _export_report(self):
         if not self.orders:
-            QMessageBox.warning(self, "提示", "请先在「整理」页扫描订单")
-            return
-        if not self.buy_rows and not self.invoice_rows:
-            QMessageBox.warning(self, "提示", "请先在「飞书」页拉取数据")
+            QMessageBox.warning(self, "提示", "请先扫描订单")
             return
         result = compare.compare(self.orders, self.buy_rows, self.invoice_rows)
-        rows = []
-        for cat, items in [
-            ("未申请购买", result["no_buy"]),
-            ("已申请未提交发票", result["buy_ok_no_invoice"]),
-            ("已闭环", result["closed"]),
-            ("无法解析", result["unknown"]),
-        ]:
-            for it in items:
-                rows.append([cat, it["订单"], it["金额"], it["购买申请"], it["发票"]])
-        self._fill_table(self.cmp_table, rows)
-        self._last_report = compare.build_report(result)
-        self.report_view.setPlainText(self._last_report)
-
-    def _export_report(self):
-        if not self._last_report:
-            QMessageBox.warning(self, "提示", "请先运行对比")
-            return
+        text = compare.build_report(result)
         path, _ = QFileDialog.getSaveFileName(self, "导出报告", "发票对比报告.txt", "文本文件 (*.txt)")
         if path:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(self._last_report)
+                f.write(text)
             QMessageBox.information(self, "完成", f"已导出到 {path}")
 
     # ---- 自动提交缺发票 ----
@@ -670,7 +733,7 @@ class MainWindow(QMainWindow):
         for name, err in fail_list:
             lines.append(f"  ❌ {name} → {err}")
         msg = "\n".join(lines)
-        self.report_view.append("\n" + msg)
+        self.log_view.append("\n" + msg)
         QMessageBox.information(self, "自动提交结果", msg)
         self._fetch()   # 提交后自动刷新
 
