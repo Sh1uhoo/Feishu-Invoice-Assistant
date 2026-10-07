@@ -1,0 +1,20 @@
+# 构建产物
+dist/
+build/
+__pycache__/
+*.pyc
+
+# 密钥与本地配置（绝不能上传）
+config.json
+*.token
+*_out.txt
+
+# 测试脚本（含调试 token）
+t_*.py
+
+# CLI 调试日志
+cli_*.txt
+
+# 虚拟环境
+.venv/
+venv/
