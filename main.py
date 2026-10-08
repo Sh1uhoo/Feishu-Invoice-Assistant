@@ -77,6 +77,8 @@ class MainWindow(QMainWindow):
         self.orders = []          # 本地订单
         self.buy_rows = []        # 飞书购买申请
         self.invoice_rows = []    # 飞书发票提交
+        self._submitted_codes = set()   # 会话内已成功提交的购买申请实例码（防重复提交）
+        self._submitting = False        # 提交中标志（防重复点击）
         self._build_ui()
 
     # ---------------- UI ----------------
@@ -103,9 +105,9 @@ class MainWindow(QMainWindow):
         b_export = QPushButton("导出报告")
         b_export.clicked.connect(self._export_report)
         top.addWidget(b_export)
-        b_submit = QPushButton("自动提交缺发票")
-        b_submit.clicked.connect(self._auto_submit)
-        top.addWidget(b_submit)
+        self.b_submit = QPushButton("自动提交缺发票")
+        self.b_submit.clicked.connect(self._auto_submit)
+        top.addWidget(self.b_submit)
         self.overview_stat = QLabel("")
         top.addWidget(self.overview_stat, 1)
         lay.addLayout(top)
@@ -657,6 +659,9 @@ class MainWindow(QMainWindow):
         return None
 
     def _auto_submit(self):
+        if self._submitting:
+            QMessageBox.information(self, "提示", "正在提交中，请稍候（防止重复提交）")
+            return
         if not self.orders:
             QMessageBox.warning(self, "提示", "请先在「整理」页扫描订单")
             return
@@ -692,11 +697,27 @@ class MainWindow(QMainWindow):
                 buy_code.setdefault(a, r.get("实例码", ""))
 
         def job():
-            ok_list, fail_list = [], []
+            ok_list, fail_list, skip_list = [], [], []
+            # 防重复：提交前重新拉取最新发票列表，已存在有效发票提交（含审批中）的单直接跳过
+            done_amt = set()
+            try:
+                for r in fu.list_invoice():
+                    if compare._valid_status(r.get("状态")):
+                        a = compare._norm(r.get("金额"))
+                        if a is not None:
+                            done_amt.add(a)
+            except Exception:
+                pass
             for it in targets:
                 amt = it["金额"]
                 code = buy_code.get(amt, "")
                 pdf = self._find_pdf(tri_dir, amt)
+                if amt in done_amt:
+                    skip_list.append((it["订单"], "已存在有效发票提交（含审批中），跳过"))
+                    continue
+                if code and code in self._submitted_codes:
+                    skip_list.append((it["订单"], "本次会话已提交过，跳过"))
+                    continue
                 if not code:
                     fail_list.append((it["订单"], "未找到对应购买申请实例码"))
                     continue
@@ -712,24 +733,31 @@ class MainWindow(QMainWindow):
                         {"id": "widget17568428666990001", "type": "attachmentV2", "value": [fc]},
                     ]
                     ic = fu.create_instance(feishu_api.APPROVAL_INVOICE, form)
+                    self._submitted_codes.add(code)   # 记入会话，防止重复提交
                     ok_list.append((it["订单"], ic))
                 except Exception as e:
                     fail_list.append((it["订单"], str(e)))
-            return ok_list, fail_list
+            return ok_list, fail_list, skip_list
 
         sig = WorkerSignals()
         sig.done.connect(self._on_auto_submit_done)
+        self._submitting = True
+        self.b_submit.setEnabled(False)
         run_thread(job, sig)
 
     def _on_auto_submit_done(self, payload):
         ok, res = payload
+        self._submitting = False
+        self.b_submit.setEnabled(True)
         if not ok:
             QMessageBox.critical(self, "自动提交失败", str(res))
             return
-        ok_list, fail_list = res
-        lines = [f"自动提交完成：成功 {len(ok_list)}，失败 {len(fail_list)}"]
+        ok_list, fail_list, skip_list = res
+        lines = [f"自动提交完成：成功 {len(ok_list)}，跳过 {len(skip_list)}，失败 {len(fail_list)}"]
         for name, ic in ok_list:
             lines.append(f"  ✅ {name} → {ic}")
+        for name, err in skip_list:
+            lines.append(f"  ⏭ {name} → {err}")
         for name, err in fail_list:
             lines.append(f"  ❌ {name} → {err}")
         msg = "\n".join(lines)
