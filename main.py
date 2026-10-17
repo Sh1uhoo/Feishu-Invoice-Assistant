@@ -77,8 +77,10 @@ class MainWindow(QMainWindow):
         self.orders = []          # 本地订单
         self.buy_rows = []        # 飞书购买申请
         self.invoice_rows = []    # 飞书发票提交
-        self._submitted_codes = set()   # 会话内已成功提交的购买申请实例码（防重复提交）
-        self._submitting = False        # 提交中标志（防重复点击）
+        self._submitted_codes = set()   # 会话内已成功提交的购买申请实例码（防重复提交发票）
+        self._submitting = False        # 发票提交中标志（防重复点击）
+        self._submitted_buy_amts = set()   # 会话内已成功提交购买申请的金额（防重复提交）
+        self._submitting_buy = False       # 购买申请提交中标志
         self._build_ui()
 
     # ---------------- UI ----------------
@@ -108,6 +110,9 @@ class MainWindow(QMainWindow):
         self.b_submit = QPushButton("自动提交缺发票")
         self.b_submit.clicked.connect(self._auto_submit)
         top.addWidget(self.b_submit)
+        self.b_buy_submit = QPushButton("自动提交缺购买申请")
+        self.b_buy_submit.clicked.connect(self._auto_submit_buy)
+        top.addWidget(self.b_buy_submit)
         self.overview_stat = QLabel("")
         top.addWidget(self.overview_stat, 1)
         lay.addLayout(top)
@@ -637,6 +642,15 @@ class MainWindow(QMainWindow):
     #   组别 widget17628791941920001(radioV2) / 三合一PDF widget17568428666990001(attachmentV2)
     GROUP_OPTION = {"22备赛飞机队": "mujg5atu-aodbmpmn62-1"}
 
+    # 购买申请表单控件 id（查自审批定义 375BDE1F）：
+    #   金额(CNY) widget17568426428640001(amount) / 购买内容概述 widget17580423530400001(input)
+    #   购买页截图 widget17568427652960001(image)
+    BUY_FORM = {
+        "amount": "widget17568426428640001",
+        "content": "widget17580423530400001",
+        "image": "widget17568427652960001",
+    }
+
     @staticmethod
     def _find_pdf(tri_dir, amt):
         """在三合一目录中按金额找对应 PDF（命名：施宇豪_组别_金额_随机.pdf）"""
@@ -754,6 +768,105 @@ class MainWindow(QMainWindow):
             return
         ok_list, fail_list, skip_list = res
         lines = [f"自动提交完成：成功 {len(ok_list)}，跳过 {len(skip_list)}，失败 {len(fail_list)}"]
+        for name, ic in ok_list:
+            lines.append(f"  ✅ {name} → {ic}")
+        for name, err in skip_list:
+            lines.append(f"  ⏭ {name} → {err}")
+        for name, err in fail_list:
+            lines.append(f"  ❌ {name} → {err}")
+        msg = "\n".join(lines)
+        self.log_view.append("\n" + msg)
+        QMessageBox.information(self, "自动提交结果", msg)
+        self._fetch()   # 提交后自动刷新
+
+    # ---- 自动提交缺购买申请 ----
+    def _auto_submit_buy(self):
+        if self._submitting_buy:
+            QMessageBox.information(self, "提示", "正在提交购买申请中，请稍候（防止重复提交）")
+            return
+        if not self.orders:
+            QMessageBox.warning(self, "提示", "请先在「整理」页扫描订单")
+            return
+        if not self.buy_rows:
+            QMessageBox.warning(self, "提示", "请先在「飞书」页拉取数据")
+            return
+        fu = self._feishu()
+        if not fu.has_token:
+            QMessageBox.warning(self, "提示", "尚未授权登录，请先点「扫码授权登录」")
+            return
+        result = compare.compare(self.orders, self.buy_rows, self.invoice_rows)
+        targets = result["no_buy"]   # 本地有订单、飞书无购买申请
+        if not targets:
+            QMessageBox.information(self, "提示", "没有发现「本地有订单、未申请购买」的订单")
+            return
+        order_map = {o["folder"]: o for o in self.orders}
+
+        def job():
+            ok_list, fail_list, skip_list = [], [], []
+            # 防重复：提交前重新拉取最新购买申请列表
+            done_amt = set()
+            try:
+                for r in fu.list_buy():
+                    if compare._valid_status(r.get("状态")):
+                        a = compare._norm(r.get("金额"))
+                        if a is not None:
+                            done_amt.add(a)
+            except Exception:
+                pass
+            for it in targets:
+                amt = it["金额"]
+                folder = it["订单"]
+                od = order_map.get(folder, {})
+                name = od.get("name") or folder
+                if amt in done_amt:
+                    skip_list.append((folder, "已存在有效购买申请，跳过"))
+                    continue
+                if amt in self._submitted_buy_amts:
+                    skip_list.append((folder, "本次会话已提交过，跳过"))
+                    continue
+                # 找购买页截图：优先购买记录图，其次支付图，再其次第一张图片
+                img_path = None
+                try:
+                    _, pays, buys = organize.split_files(od.get("files", []))
+                    cand = buys + pays
+                    if not cand:
+                        cand = [f for f in od.get("files", [])
+                                if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp"))]
+                    img_path = cand[0] if cand else None
+                except Exception:
+                    pass
+                if not img_path:
+                    fail_list.append((folder, "订单文件夹中没有可上传的购买页截图"))
+                    continue
+                try:
+                    fc = fu.upload_file(img_path, "image")
+                    form = [
+                        {"id": self.BUY_FORM["amount"], "type": "amount", "value": amt},
+                        {"id": self.BUY_FORM["content"], "type": "input", "value": name},
+                        {"id": self.BUY_FORM["image"], "type": "image", "value": [fc]},
+                    ]
+                    ic = fu.create_instance(feishu_api.APPROVAL_BUY, form)
+                    self._submitted_buy_amts.add(amt)
+                    ok_list.append((folder, ic))
+                except Exception as e:
+                    fail_list.append((folder, str(e)))
+            return ok_list, fail_list, skip_list
+
+        sig = WorkerSignals()
+        sig.done.connect(self._on_auto_submit_buy_done)
+        self._submitting_buy = True
+        self.b_buy_submit.setEnabled(False)
+        run_thread(job, sig)
+
+    def _on_auto_submit_buy_done(self, payload):
+        ok, res = payload
+        self._submitting_buy = False
+        self.b_buy_submit.setEnabled(True)
+        if not ok:
+            QMessageBox.critical(self, "自动提交失败", str(res))
+            return
+        ok_list, fail_list, skip_list = res
+        lines = [f"购买申请自动提交：成功 {len(ok_list)}，跳过 {len(skip_list)}，失败 {len(fail_list)}"]
         for name, ic in ok_list:
             lines.append(f"  ✅ {name} → {ic}")
         for name, err in skip_list:
