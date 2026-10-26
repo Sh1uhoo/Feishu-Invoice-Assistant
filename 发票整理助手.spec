@@ -1,10 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+import sys
 
+_pydll = os.path.join(os.path.dirname(sys.executable), 'DLLs')
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[('C:/Users/shiyuhao/AppData/Local/Doubao/User Data/sandbox_runtime/bases/c98c5042338ed152c6f10ecd8591889f/python/DLLs/libssl-3-x64.dll', '.'), ('C:/Users/shiyuhao/AppData/Local/Doubao/User Data/sandbox_runtime/bases/c98c5042338ed152c6f10ecd8591889f/python/DLLs/libcrypto-3-x64.dll', '.')],
+    binaries=[(os.path.join(_pydll, 'libssl-3-x64.dll'), '.'), (os.path.join(_pydll, 'libcrypto-3-x64.dll'), '.')],
     datas=[],
     hiddenimports=[],
     hookspath=[],
